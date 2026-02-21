@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>Обращение #{{ ticket.id }} — F.I.R.E.</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
+</head>
+<body class="bg-light">
+<nav class="navbar navbar-dark bg-dark mb-4">
+  <div class="container">
+    <a href="/" class="navbar-brand fw-bold">&#128293; F.I.R.E.</a>
+    <span class="text-white-50">Обращение #{{ ticket.id }}</span>
+  </div>
+</nav>
+
+<div class="container">
+  <a href="/" class="btn btn-outline-secondary btn-sm mb-3">&larr; Назад к панели</a>
+
+  <div class="row g-4">
+
+    <!-- Левая часть: Обращение + AI-анализ -->
+    <div class="col-md-7">
+
+      <!-- Информация о клиенте -->
+      <div class="card shadow-sm mb-3">
+        <div class="card-header fw-semibold">Информация о клиенте</div>
+        <div class="card-body">
+          <table class="table table-sm mb-0">
+            <tr><th width="35%">GUID</th><td class="font-monospace small">{{ ticket.guid or '—' }}</td></tr>
+            <tr><th>Сегмент</th><td>
+              {% if ticket.segment == 'VIP' %}<span class="badge bg-warning text-dark">VIP</span>
+              {% elif ticket.segment == 'Priority' %}<span class="badge bg-danger">Priority</span>
+              {% else %}<span class="badge bg-secondary">{{ ticket.segment }}</span>{% endif %}
+            </td></tr>
+            <tr><th>Пол</th><td>{{ ticket.gender or '—' }}</td></tr>
+            <tr><th>Дата рождения</th><td>{{ ticket.birth_date or '—' }}</td></tr>
+            <tr><th>Область</th><td>{{ ticket.region or '—' }}</td></tr>
+            <tr><th>Город</th><td>{{ ticket.city or '—' }}</td></tr>
+            <tr><th>Адрес</th><td>{{ (ticket.street or '') + ' ' + (ticket.building or '') }}</td></tr>
+            <tr><th>Вложения</th><td>
+              {% if ticket.attachments %}
+                {{ ticket.attachments }}
+                <br><img src="/attachment/{{ ticket.attachments }}" class="img-fluid mt-2" style="max-width: 400px; border: 1px solid #dee2e6; border-radius: 4px;" alt="{{ ticket.attachments }}">
+              {% else %}
+                Нет
+              {% endif %}
+            </td></tr>
+          </table>
+        </div>
+      </div>
+
+      <!-- Описание -->
+      <div class="card shadow-sm mb-3">
+        <div class="card-header fw-semibold">Описание обращения</div>
+        <div class="card-body">
+          <p class="mb-0" style="white-space: pre-wrap;">{{ ticket.description or '(пусто)' }}</p>
+        </div>
+      </div>
+
+      {% if analysis %}
+      <!-- AI-резюме -->
+      <div class="card shadow-sm border-info mb-3">
+        <div class="card-header bg-info text-white fw-semibold">AI-резюме</div>
+        <div class="card-body">
+          <p class="mb-2"><strong>Краткое содержание:</strong> {{ analysis.summary or '—' }}</p>
+          <p class="mb-0"><strong>Рекомендация:</strong> {{ analysis.recommendation or '—' }}</p>
+        </div>
+      </div>
+      {% endif %}
+    </div>
+
+    <!-- Правая часть: Анализ + Менеджер + Маршрутизация -->
+    <div class="col-md-5">
+
+      {% if analysis %}
+      <!-- Результаты AI-анализа -->
+      <div class="card shadow-sm mb-3">
+        <div class="card-header fw-semibold">Результаты AI-анализа</div>
+        <div class="card-body">
+          <table class="table table-sm mb-0">
+            <tr>
+              <th>Тип</th>
+              <td><span class="badge bg-primary">{{ analysis.ticket_type or '—' }}</span></td>
+            </tr>
+            <tr>
+              <th>Тональность</th>
+              <td>
+                {% if analysis.sentiment == 'Negative' %}<span class="badge bg-danger">Negative</span>
+                {% elif analysis.sentiment == 'Positive' %}<span class="badge bg-success">Positive</span>
+                {% else %}<span class="badge bg-secondary">Neutral</span>{% endif %}
+              </td>
+            </tr>
+            <tr>
+              <th>Приоритет</th>
+              <td>
+                <span class="badge
+                  {% if analysis.priority_score >= 8 %}bg-danger
+                  {% elif analysis.priority_score >= 5 %}bg-warning text-dark
+                  {% else %}bg-secondary{% endif %}
+                  fs-6">
+                  {{ analysis.priority_score }} / 10
+                </span>
+              </td>
+            </tr>
+            <tr>
+              <th>Язык</th>
+              <td><span class="badge bg-info text-dark">{{ analysis.language or '—' }}</span></td>
+            </tr>
+            {% if analysis.latitude %}
+            <tr>
+              <th>GPS</th>
+              <td class="font-monospace small">{{ "%.4f"|format(analysis.latitude) }}, {{ "%.4f"|format(analysis.longitude) }}</td>
+            </tr>
+            {% endif %}
+          </table>
+        </div>
+      </div>
+      {% else %}
+      <div class="alert alert-warning">Это обращение ещё не обработано.</div>
+      {% endif %}
+
+      <!-- Назначенный менеджер -->
+      <div class="card shadow-sm mb-3">
+        <div class="card-header fw-semibold">Назначенный менеджер</div>
+        <div class="card-body">
+          {% if manager %}
+          <h5 class="card-title">{{ manager.full_name }}</h5>
+          <p class="mb-1"><strong>Должность:</strong> {{ manager.position }}</p>
+          <p class="mb-1"><strong>Офис:</strong> {{ office.name if office else '—' }}</p>
+          <p class="mb-1"><strong>Навыки:</strong>
+            {% if manager.skills %}
+              {% for skill in manager.skills %}
+                <span class="badge bg-secondary">{{ skill }}</span>
+              {% endfor %}
+            {% else %}
+              <span class="text-muted">Нет</span>
+            {% endif %}
+          </p>
+          <p class="mb-0"><strong>Текущая нагрузка:</strong>
+            <span class="badge bg-{% if manager.current_workload >= 5 %}danger{% elif manager.current_workload >= 3 %}warning text-dark{% else %}success{% endif %}">
+              {{ manager.current_workload }} обращений
+            </span>
+          </p>
+          {% else %}
+          <div class="alert alert-danger mb-0">
+            <strong>Не назначен</strong> — подходящий менеджер не найден.<br>
+            <small>Требуется ручная проверка.</small>
+          </div>
+          {% endif %}
+        </div>
+      </div>
+
+      {% if office %}
+      <!-- Офис -->
+      <div class="card shadow-sm mb-3">
+        <div class="card-header fw-semibold">Назначенный офис</div>
+        <div class="card-body">
+          <h6>{{ office.name }}</h6>
+          <p class="text-muted small mb-0">{{ office.address }}</p>
+          {% if office.latitude %}
+          <p class="text-muted small mb-0 mt-1 font-monospace">{{ "%.4f"|format(office.latitude) }}, {{ "%.4f"|format(office.longitude) }}</p>
+          {% endif %}
+        </div>
+      </div>
+      {% endif %}
+
+      {% if analysis and analysis.assignment_reason %}
+      <!-- Объяснение маршрутизации -->
+      <div class="card shadow-sm border-warning mb-3">
+        <div class="card-header bg-warning text-dark fw-semibold">Объяснение маршрутизации</div>
+        <div class="card-body small">
+          {% set r = analysis.assignment_reason %}
+          <table class="table table-sm mb-0">
+            <tr>
+              <th>Ближайший офис</th>
+              <td>{{ r.nearest_office or '—' }}</td>
+            </tr>
+            {% if r.distance_km is not none %}
+            <tr>
+              <th>Расстояние</th>
+              <td>{{ r.distance_km }} км</td>
+            </tr>
+            {% endif %}
+            <tr>
+              <th>Начальных кандидатов</th>
+              <td>{{ r.candidates_initial }}</td>
+            </tr>
+            {% if r.filters_applied %}
+            <tr>
+              <th>Применённые фильтры</th>
+              <td>
+                {% for f in r.filters_applied %}
+                  <span class="badge bg-secondary me-1">{{ f }}</span>
+                {% endfor %}
+              </td>
+            </tr>
+            {% endif %}
+            <tr>
+              <th>После фильтров</th>
+              <td>{{ r.candidates_after_filters }}</td>
+            </tr>
+            {% if r.top2_managers %}
+            <tr>
+              <th>Топ-2 кандидата</th>
+              <td>
+                {% for mgr in r.top2_managers %}
+                  <div>{{ mgr }}</div>
+                {% endfor %}
+              </td>
+            </tr>
+            {% endif %}
+            <tr>
+              <th>Метод выбора</th>
+              <td><span class="badge bg-primary">{{ r.chosen_by }}</span></td>
+            </tr>
+            <tr>
+              <th>Причина</th>
+              <td>{{ r.chosen_reason }}</td>
+            </tr>
+          </table>
+        </div>
+      </div>
+      {% endif %}
+
+    </div><!-- /col -->
+  </div><!-- /row -->
+</div><!-- /container -->
+</body>
+</html>
