@@ -195,6 +195,12 @@ def process_tickets():
     log(f"[PROCESS] Analyzing {len(tickets)} tickets with AI (2 workers)...")
     ai_results = {}
 
+    # Eager-load all ORM attributes before passing to threads
+    # (SQLAlchemy sessions are not thread-safe for lazy loading)
+    for t in tickets:
+        _ = t.description, t.country, t.region, t.city, t.street, t.building
+        _ = t.segment, t.attachments, t.guid
+
     def analyze_one(ticket):
         return ticket.id, analyze_ticket(ticket)
 

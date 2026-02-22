@@ -3,7 +3,7 @@
 routing.py — Business rules engine for ticket-to-manager assignment.
 
 Cascade logic:
-  1. Find nearest office by GPS distance (or split Astana/Almaty if unknown)
+  1. Match city name or find nearest office by Haversine (client coords from Yandex API)
   2. Filter managers at that office by hard skills (VIP, position, language)
   3. Pick top-2 by lowest workload
   4. Assign via persistent round-robin counter
@@ -12,6 +12,88 @@ import math
 from typing import Optional, Tuple
 
 from models import db, RoutingState
+
+# Hardcoded GPS coordinates for all 15 Freedom Finance offices in Kazakhstan.
+# Used as the ground truth for Haversine distance calculation against
+# client coordinates obtained from Yandex Maps Geocoder API.
+OFFICE_COORDS = {
+    "Актау":             (43.6520, 51.2100),
+    "Актобе":            (50.2797, 57.2074),
+    "Алматы":            (43.2389, 76.8897),
+    "Астана":            (51.1801, 71.4460),
+    "Атырау":            (47.1066, 51.9146),
+    "Караганда":         (49.8047, 73.1094),
+    "Кокшетау":          (53.2836, 69.3962),
+    "Костанай":          (53.2147, 63.6265),
+    "Кызылорда":         (44.8490, 65.5074),
+    "Павлодар":          (52.2867, 76.9677),
+    "Петропавловск":     (54.8749, 69.1586),
+    "Тараз":             (42.9002, 71.3784),
+    "Уральск":           (51.2337, 51.3697),
+    "Усть-Каменогорск":  (49.9488, 82.6271),
+    "Шымкент":           (42.3170, 69.5963),
+}
+
+# Maps Kazakhstan regions (oblasts) to the nearest office city.
+# Covers all current oblasts, legacy names, and common spelling variants.
+REGION_TO_OFFICE = {
+    # Standard oblasts
+    "алматинская": "Алматы",
+    "акмолинская": "Кокшетау",
+    "актюбинская": "Актобе",
+    "атырауская": "Атырау",
+    "восточно-казахстанская": "Усть-Каменогорск",
+    "жамбылская": "Тараз",
+    "западно-казахстанская": "Уральск",
+    "карагандинская": "Караганда",
+    "костанайская": "Костанай",
+    "кызылординская": "Кызылорда",
+    "мангистауская": "Актау",
+    "павлодарская": "Павлодар",
+    "северо-казахстанская": "Петропавловск",
+    "туркестанская": "Шымкент",
+    "абайская": "Усть-Каменогорск",
+    "жетісуская": "Алматы",
+    "жетисуская": "Алматы",
+    "ұлытауская": "Караганда",
+    "улытауская": "Караганда",
+    # Cities of republican significance
+    "г. алматы": "Алматы",
+    "г. астана": "Астана",
+    "г. шымкент": "Шымкент",
+    "алматы": "Алматы",
+    "астана": "Астана",
+    "шымкент": "Шымкент",
+    # Legacy / alternate names found in ticket data
+    "юко": "Шымкент",
+    "южно-казахстанская": "Шымкент",
+    "семипалатинская": "Усть-Каменогорск",
+    "вко": "Усть-Каменогорск",
+    # English / transliterated names from ticket data
+    "mangystau": "Актау",
+    "almaty": "Алматы",
+    "astana": "Астана",
+}
+
+
+def _find_office_by_region(region: str, offices):
+    """Match a region/oblast string to an office using REGION_TO_OFFICE mapping."""
+    if not region:
+        return None
+    region_lower = region.lower().strip()
+    # Try exact match first
+    if region_lower in REGION_TO_OFFICE:
+        target_city = REGION_TO_OFFICE[region_lower]
+        for o in offices:
+            if o.name == target_city:
+                return o
+    # Try substring match (e.g. "Северо-Казахстанская обл." contains "северо-казахстанская")
+    for key, target_city in REGION_TO_OFFICE.items():
+        if key in region_lower or region_lower in key:
+            for o in offices:
+                if o.name == target_city:
+                    return o
+    return None
 
 
 def _get_rr_counter() -> int:
@@ -49,14 +131,28 @@ def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return R * 2 * math.asin(math.sqrt(a))
 
 
+def _office_coords(office):
+    """Get (lat, lon) for an office — hardcoded coords first, DB fallback."""
+    if office.name in OFFICE_COORDS:
+        return OFFICE_COORDS[office.name]
+    if office.latitude is not None and office.longitude is not None:
+        return (office.latitude, office.longitude)
+    return None
+
+
 def find_nearest_office(lat: float, lon: float, offices):
-    """Return the Office object closest to the given coordinates."""
-    return min(
-        offices,
-        key=lambda o: haversine(lat, lon, o.latitude, o.longitude)
-        if (o.latitude and o.longitude)
-        else float("inf"),
-    )
+    """Return (Office, distance_km) closest to the given client coordinates."""
+    best_office = None
+    best_dist = float("inf")
+    for o in offices:
+        coords = _office_coords(o)
+        if coords is None:
+            continue
+        dist = haversine(lat, lon, coords[0], coords[1])
+        if dist < best_dist:
+            best_dist = dist
+            best_office = o
+    return best_office, round(best_dist, 1)
 
 
 def assign_ticket(ticket, analysis: dict, offices, managers) -> Tuple[Optional[object], Optional[object], dict]:
@@ -77,28 +173,65 @@ def assign_ticket(ticket, analysis: dict, offices, managers) -> Tuple[Optional[o
         "chosen_reason": "",
     }
 
+    # ── Spam → never assign ──────────────────────────────────────
+    if analysis.get("ticket_type") == "Спам":
+        reason["chosen_by"] = "spam_filter"
+        reason["chosen_reason"] = "Spam ticket — not assigned to any manager"
+        return None, None, reason
+
+    # ── VIP/Priority segment → force priority 10 ─────────────────
+    if ticket.segment in ("VIP", "Priority"):
+        analysis["priority_score"] = 10
+
     rr_counter = _get_rr_counter()
     lat = analysis.get("latitude")
     lon = analysis.get("longitude")
 
-    # ── STEP 1: Determine target office(s) ──────────────────────────
-    if lat and lon:
-        nearest = find_nearest_office(lat, lon, offices)
+    # ── STEP 1: Determine target office ──────────────────────────
+    # 1a. Try exact city name match first
+    city = getattr(ticket, "city", "") or ""
+    city_match = None
+    if city:
+        city_lower = city.lower()
+        for o in offices:
+            if o.name and (o.name.lower() == city_lower or o.name.lower() in city_lower or city_lower in o.name.lower()):
+                city_match = o
+                break
+
+    if city_match:
+        target_ids = [city_match.id]
+        fallback_office = city_match
+        reason["nearest_office"] = city_match.name
+        reason["distance_km"] = 0.0
+        reason["filters_applied"].append("city_name_match")
+    elif lat is not None and lon is not None:
+        # 1b. Use Haversine to find nearest office by client GPS (from Yandex API)
+        nearest, dist = find_nearest_office(lat, lon, offices)
         target_ids = [nearest.id]
-        dist = haversine(lat, lon, nearest.latitude, nearest.longitude)
         reason["nearest_office"] = nearest.name
-        reason["distance_km"] = round(dist, 1)
+        reason["distance_km"] = dist
+        reason["client_coords"] = [lat, lon]
+        office_c = _office_coords(nearest)
+        reason["office_coords"] = list(office_c) if office_c else None
         fallback_office = nearest
     else:
-        # Unknown / foreign address → pool Astana + Almaty
-        special = [o for o in offices if o.name in ("Астана", "Алматы")]
-        if not special:
-            special = offices[:2]
-        target_ids = [o.id for o in special]
-        fallback_office = special[rr_counter % len(special)]
-        reason["nearest_office"] = "Астана/Алматы (fallback)"
-        reason["distance_km"] = None
-        reason["filters_applied"].append("unknown_address_fallback")
+        # 1c. Try region/oblast mapping as last resort
+        region = getattr(ticket, "region", "") or ""
+        region_match = _find_office_by_region(region, offices)
+        if region_match:
+            target_ids = [region_match.id]
+            fallback_office = region_match
+            reason["nearest_office"] = region_match.name
+            reason["distance_km"] = None
+            reason["filters_applied"].append("region_match")
+        else:
+            # No location info at all — assign to Astana as default
+            default = next((o for o in offices if o.name == "Астана"), offices[0])
+            target_ids = [default.id]
+            fallback_office = default
+            reason["nearest_office"] = default.name
+            reason["distance_km"] = None
+            reason["filters_applied"].append("no_location_default")
 
     # ── STEP 2: Candidates at target office(s) ──────────────────────
     candidates = [m for m in managers if m.office_id in target_ids]
@@ -130,6 +263,29 @@ def assign_ticket(ticket, analysis: dict, offices, managers) -> Tuple[Optional[o
     reason["candidates_after_filters"] = len(candidates)
 
     if not candidates:
+        # VIP/Priority fallback: find the least busy VIP manager across ALL offices
+        if ticket.segment in ("VIP", "Priority"):
+            vip_all = [m for m in managers if m.skills and "VIP" in m.skills]
+            # Apply language filter to global VIP pool too
+            if lang == "KZ":
+                vip_all = [m for m in vip_all if m.skills and "KZ" in m.skills]
+            elif lang == "ENG":
+                vip_all = [m for m in vip_all if m.skills and "ENG" in m.skills]
+            if vip_all:
+                vip_all.sort(key=lambda m: m.current_workload)
+                chosen = vip_all[0]
+                # Determine the office of the chosen manager
+                chosen_office = next((o for o in offices if o.id == chosen.office_id), fallback_office)
+                reason["filters_applied"].append("vip_global_fallback")
+                reason["chosen_by"] = "vip_least_loaded"
+                reason["chosen_reason"] = (
+                    f"No VIP manager at {fallback_office.name}. "
+                    f"Assigned to least busy VIP manager: {chosen.full_name} "
+                    f"at {chosen_office.name} (workload: {chosen.current_workload})"
+                )
+                chosen.current_workload += 1
+                return chosen, chosen_office, reason
+
         print(
             f"  [ROUTING] No qualified manager found for ticket {ticket.id} "
             f"(segment={ticket.segment}, type={analysis.get('ticket_type')}, lang={lang})"
@@ -158,7 +314,7 @@ def assign_ticket(ticket, analysis: dict, offices, managers) -> Tuple[Optional[o
     # Increment workload (persisted when caller commits)
     chosen.current_workload += 1
 
-    target_office = fallback_office if not (lat and lon) else find_nearest_office(lat, lon, offices)
+    target_office = fallback_office
     return chosen, target_office, reason
 
 

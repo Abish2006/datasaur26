@@ -4,12 +4,13 @@ ai_module.py — OpenAI API integration for ticket analysis.
 Supports image attachments via vision API (gpt-4o-mini).
 """
 import json
-import re
 import os
 import base64
 import time
 
-from config import OPENAI_API_KEY, OPENAI_MODEL
+import requests
+
+from config import OPENAI_API_KEY, OPENAI_MODEL, YANDEX_MAPS_API_KEY
 
 _client = None
 
@@ -93,9 +94,82 @@ KNOWN_IMAGES = {
 }
 
 
+def geocode_address(address: str):
+    """
+    Call Yandex Geocoder API to get (lat, lon) for an address.
+    Returns (lat, lon) or (None, None) on failure.
+    """
+    if not YANDEX_MAPS_API_KEY or not address:
+        return None, None
+
+    try:
+        resp = requests.get(
+            "https://geocode-maps.yandex.ru/1.x/",
+            params={
+                "apikey": YANDEX_MAPS_API_KEY,
+                "geocode": address,
+                "format": "json",
+                "results": 1,
+            },
+            timeout=5,
+        )
+        data = resp.json()
+        features = (
+            data.get("response", {})
+            .get("GeoObjectCollection", {})
+            .get("featureMember", [])
+        )
+        if features:
+            pos = features[0]["GeoObject"]["Point"]["pos"]
+            lon_str, lat_str = pos.split()
+            lat, lon = float(lat_str), float(lon_str)
+            print(f"  [GEO] Geocoded -> ({lat}, {lon})")
+            return lat, lon
+        else:
+            print(f"  [GEO] No result for: {address}")
+            return None, None
+    except Exception as e:
+        print(f"  [GEO] Geocoding error: {e}")
+        return None, None
+
+
+def _is_spam(description_text: str) -> bool:
+    """Detect spam by checking for non-Freedom-Finance-related advertising keywords."""
+    desc_lower = (description_text or "").lower()
+    if not desc_lower.strip():
+        return False
+
+    # Advertising / commercial spam indicators
+    spam_keywords = [
+        "сварочн", "агрегат", "et-welding",          # welding equipment
+        "тюльпан", "срезка", "питомник",              # flower sales
+        "садовый центр",                               # garden center
+        "день инвестора", "приглашаем вас",            # event invitations from other companies
+        "первоуральскбанк",                            # other banks
+        "московская биржа",                            # Moscow exchange invitations
+        "регистрация\n",                               # event registration
+        "специальные цены", "минимальный заказ",       # commercial offers
+        "отгрузка",                                    # shipping/delivery ads
+        "fittonia.ru",                                 # non-Freedom domains
+        "enkod.ru",                                    # marketing platform links
+    ]
+    # If message contains multiple spam indicators, it's very likely spam
+    hits = sum(1 for kw in spam_keywords if kw in desc_lower)
+    return hits >= 2
+
+
 def postprocess_analysis(result, description_text="", attachment_name=""):
     """Apply rule-based corrections after AI analysis."""
     desc_lower = (description_text or "").lower()
+
+    # Spam detection: override AI if message is clearly non-Freedom-related
+    if _is_spam(description_text):
+        result["ticket_type"] = "Спам"
+        result["priority_score"] = 1
+        result["sentiment"] = "Neutral"
+        result["summary"] = result.get("summary", "") or "Спам — сообщение не связано с услугами Freedom Finance."
+        result["recommendation"] = "Игнорировать. Сообщение не относится к услугам компании."
+        return result
 
     # Fraud tickets → high priority
     if result.get("ticket_type") == "Мошеннические действия":
@@ -124,6 +198,7 @@ def analyze_ticket(ticket) -> dict:
       summary, recommendation, latitude, longitude
     """
     address_parts = [
+        ticket.country or "Казахстан",
         ticket.region or "",
         ticket.city or "",
         ticket.street or "",
@@ -183,21 +258,25 @@ Return this exact JSON structure:
   "priority_score": <integer 1-10>,
   "language": "<KZ | ENG | RU>",
   "summary": "<1-2 sentence summary of the issue in Russian>",
-  "recommendation": "<actionable advice for the manager in Russian, 1-2 sentences>",
-  "latitude": <float or null>,
-  "longitude": <float or null>
+  "recommendation": "<actionable advice for the manager in Russian, 1-2 sentences>"
 }}
 
 Rules:
 - ticket_type: pick the best matching category from the list above.
+  SPAM DETECTION: If the message is NOT related to Freedom Finance brokerage services
+  (e.g. selling flowers, welding equipment, event invitations from other companies,
+  unsolicited advertising), classify as "Спам". Only Freedom Finance customer issues
+  are legitimate tickets.
 - sentiment: how the customer feels (Positive/Neutral/Negative).
 - priority_score: 1=least urgent (general question), 10=most urgent (fraud, account blocked, money lost).
-- language: detect the primary language of the ticket text. Default to RU if unclear or mixed.
+  Spam tickets must always get priority_score=1.
+- language: detect the PRIMARY language of the ticket text.
+  If the text is written in English (e.g. "Hello", "I am trying", "Please"), set language to "ENG".
+  If the text is written in Kazakh (e.g. contains Kazakh-specific letters like қ, ұ, ғ, ә, ө, or Kazakh words), set language to "KZ".
+  If the text is written in Russian, set language to "RU".
+  Default to "RU" only if the language is truly unclear.
 - summary: concise description of the problem in Russian.
-- recommendation: what the manager should do first.
-- latitude/longitude: approximate GPS coordinates for the city/region in Kazakhstan.
-  If the city is recognizable (e.g. Алматы, Астана, Шымкент), return its coordinates.
-  If the address is empty, unknown, or outside Kazakhstan, return null for both."""
+- recommendation: what the manager should do first."""
 
     # Build message content blocks
     content_blocks = []
@@ -261,6 +340,12 @@ Rules:
 
         # Post-processing corrections
         result = postprocess_analysis(result, description_text, attachment_name)
+
+        # Geocode address via Google Maps API (override LLM guess)
+        geo_lat, geo_lon = geocode_address(address)
+        if geo_lat is not None and geo_lon is not None:
+            result["latitude"] = geo_lat
+            result["longitude"] = geo_lon
 
         return result
 
