@@ -263,35 +263,51 @@ def assign_ticket(ticket, analysis: dict, offices, managers) -> Tuple[Optional[o
     reason["candidates_after_filters"] = len(candidates)
 
     if not candidates:
-        # VIP/Priority fallback: find the least busy VIP manager across ALL offices
-        if ticket.segment in ("VIP", "Priority"):
-            vip_all = [m for m in managers if m.skills and "VIP" in m.skills]
-            # Apply language filter to global VIP pool too
+        # No eligible manager at local office — search other offices by distance
+        # Sort all offices by distance from the fallback office coords
+        fb_coords = _office_coords(fallback_office)
+        other_offices = [o for o in offices if o.id not in target_ids]
+        if fb_coords:
+            other_offices.sort(
+                key=lambda o: haversine(fb_coords[0], fb_coords[1], *_office_coords(o))
+                if _office_coords(o) else float("inf")
+            )
+
+        for other in other_offices:
+            pool = [m for m in managers if m.office_id == other.id]
+            # Apply the same skill filters
+            if ticket.segment in ("VIP", "Priority"):
+                pool = [m for m in pool if m.skills and "VIP" in m.skills]
+            if analysis.get("ticket_type") == "Смена данных":
+                pool = [m for m in pool if m.position == "Главный специалист"]
             if lang == "KZ":
-                vip_all = [m for m in vip_all if m.skills and "KZ" in m.skills]
+                pool = [m for m in pool if m.skills and "KZ" in m.skills]
             elif lang == "ENG":
-                vip_all = [m for m in vip_all if m.skills and "ENG" in m.skills]
-            if vip_all:
-                vip_all.sort(key=lambda m: m.current_workload)
-                chosen = vip_all[0]
-                # Determine the office of the chosen manager
-                chosen_office = next((o for o in offices if o.id == chosen.office_id), fallback_office)
-                reason["filters_applied"].append("vip_global_fallback")
-                reason["chosen_by"] = "vip_least_loaded"
+                pool = [m for m in pool if m.skills and "ENG" in m.skills]
+            if pool:
+                pool.sort(key=lambda m: m.current_workload)
+                chosen = pool[0]
+                other_coords = _office_coords(other)
+                dist_to_other = (
+                    round(haversine(fb_coords[0], fb_coords[1], other_coords[0], other_coords[1]), 1)
+                    if fb_coords and other_coords else None
+                )
+                reason["filters_applied"].append("nearest_office_fallback")
+                reason["chosen_by"] = "nearest_qualified"
                 reason["chosen_reason"] = (
-                    f"No VIP manager at {fallback_office.name}. "
-                    f"Assigned to least busy VIP manager: {chosen.full_name} "
-                    f"at {chosen_office.name} (workload: {chosen.current_workload})"
+                    f"No eligible manager at {fallback_office.name}. "
+                    f"Assigned to nearest qualified: {chosen.full_name} "
+                    f"at {other.name} ({dist_to_other} km away, workload: {chosen.current_workload})"
                 )
                 chosen.current_workload += 1
-                return chosen, chosen_office, reason
+                return chosen, other, reason
 
         print(
             f"  [ROUTING] No qualified manager found for ticket {ticket.id} "
             f"(segment={ticket.segment}, type={analysis.get('ticket_type')}, lang={lang})"
         )
         reason["chosen_by"] = "unassigned"
-        reason["chosen_reason"] = "No qualified manager found after applying filters"
+        reason["chosen_reason"] = "No qualified manager found at any office"
         return None, fallback_office, reason
 
     # ── STEP 4: Sort by workload, pick top 2 ────────────────────────
